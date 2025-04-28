@@ -3,6 +3,7 @@ pragma solidity ^0.8.0;
 
 import "./IERC20.sol";
 import "./ECDSA.sol";
+import "./ReentrancyGuard.sol"; // 加上这一行
 
 interface IPancakeRouter {
     function swapExactTokensForTokensSupportingFeeOnTransferTokens(
@@ -14,9 +15,10 @@ interface IPancakeRouter {
     ) external;
 
     function WETH() external pure returns (address);
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory); // ✅加这一行
 }
 
-contract IGTExchangeManager {
+contract IGTExchangeManager is ReentrancyGuard { // 继承 ReentrancyGuard
     using ECDSA for bytes32;
 
     address public owner;
@@ -53,7 +55,6 @@ contract IGTExchangeManager {
         sysToken = _sysToken;
         router = _router;
 
-        // 提前永久授权 IGT 和 SYS 给 Router
         IERC20(igtToken).approve(router, type(uint256).max);
         IERC20(sysToken).approve(router, type(uint256).max);
     }
@@ -72,48 +73,46 @@ contract IGTExchangeManager {
         uint256 endTime,
         uint256 nonce,
         bytes calldata signature
-    ) external {
+    ) external nonReentrant {
         require(block.timestamp <= endTime, "Signature expired");
         require(userNonce[msg.sender] == nonce, "Invalid nonce");
 
         bytes32 hash = keccak256(abi.encodePacked("sell", msg.sender, igtAmount, endTime, nonce));
-        emit DebugHash(hash); // 需要先在合约顶部添加 event DebugHash(bytes32);
+        emit DebugHash(hash);
         require(_verify(hash, signature), "Invalid signature");
 
         userNonce[msg.sender]++;
 
+        // 第一步：IGT 换 SYS
+        uint256 sysReceived = _swapExactTokens(igtToken, sysToken, igtAmount);
+        uint256 halfSys = sysReceived / 2;
+        sysQuota[msg.sender] += halfSys;
+
+        // 第二步：一半 SYS 换回 IGT
+        uint256 igtReceived = _swapExactTokens(sysToken, igtToken, halfSys);
+        igtQuota[msg.sender] += igtReceived;
+
+        emit SellExecuted(msg.sender, igtAmount);
+    }
+
+    function _swapExactTokens(address tokenIn, address tokenOut, uint256 amountIn) internal returns (uint256 amountOut) {
         address[] memory path = new address[](2);
-        path[0] = igtToken;
-        path[1] = sysToken;
-        uint256 beforeSysBalance = IERC20(sysToken).balanceOf(address(this));
-        // 用合约自己的 IGT 买 SYS
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+
+        uint256 beforeBalance = IERC20(tokenOut).balanceOf(address(this));
+        uint256 expectedOut = getAmountsOut(tokenIn, tokenOut, amountIn);
+        uint256 amountOutMin = expectedOut * 85 / 100; // 允许15%滑点
+
         IPancakeRouter(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
-            igtAmount,
-            0,
+            amountIn,
+            amountOutMin,
             path,
             address(this),
             block.timestamp + 300
         );
-        uint256 sysReceived = IERC20(sysToken).balanceOf(address(this)) - beforeSysBalance;
-        uint256 halfSys = sysReceived / 2;
 
-        sysQuota[msg.sender] += halfSys;
-
-        address[] memory path2 = new address[](2);
-        path2[0] = sysToken;
-        path2[1] = igtToken;
-        uint256 beforeSysBalanceigt = IERC20(igtToken).balanceOf(address(this));
-        IPancakeRouter(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
-            halfSys,
-            0,
-            path2,
-            address(this),
-            block.timestamp + 300
-        );
-        uint256 igtReceived = IERC20(igtToken).balanceOf(address(this)) - beforeSysBalanceigt;
-        igtQuota[msg.sender] += igtReceived;
-
-        emit SellExecuted(msg.sender, igtAmount);
+        amountOut = IERC20(tokenOut).balanceOf(address(this)) - beforeBalance;
     }
 
     function buy(
@@ -121,13 +120,12 @@ contract IGTExchangeManager {
         uint256 endTime,
         uint256 nonce,
         bytes calldata signature
-    ) external {
-
+    ) external nonReentrant { // 加 nonReentrant
         require(block.timestamp <= endTime, "Signature expired");
         require(userNonce[msg.sender] == nonce, "Invalid nonce");
 
         bytes32 hash = keccak256(abi.encodePacked("buy", msg.sender, igtAmount, endTime, nonce));
-        emit DebugHash(hash); // 需要先在合约顶部添加 event DebugHash(bytes32);
+        emit DebugHash(hash);
         require(_verify(hash, signature), "Invalid signature");
 
         userNonce[msg.sender]++;
@@ -136,14 +134,16 @@ contract IGTExchangeManager {
         path[0] = igtToken;
         path[1] = sysToken;
         uint256 beforeSysBalance = IERC20(sysToken).balanceOf(address(this));
-        // 用合约自己的 IGT 买 SYS
+        uint256 expectedOut = getAmountsOut(igtToken, sysToken, igtAmount);
+        uint256 amountOutMin = expectedOut * 85 / 100; // 允许5%滑点保护
         IPancakeRouter(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
             igtAmount,
-            0,
+            amountOutMin,
             path,
             address(this),
             block.timestamp + 300
         );
+
         uint256 afterSysBalance = IERC20(sysToken).balanceOf(address(this));
         uint256 sysReceived = afterSysBalance - beforeSysBalance;
         sysQuota[msg.sender] += sysReceived;
@@ -151,7 +151,16 @@ contract IGTExchangeManager {
         emit BuyExecuted(msg.sender, igtAmount);
     }
 
-    function claim(address token, uint256 amount) external {
+    function getAmountsOut(address tokenIn, address tokenOut, uint256 amountIn) public view returns (uint256) {
+        address[] memory path = new address[](2);
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+        uint256[] memory amounts = IPancakeRouter(router).getAmountsOut(amountIn, path);
+        return amounts[1];
+    }
+
+
+    function claim(address token, uint256 amount) external nonReentrant { // 加 nonReentrant
         if (msg.sender != owner) {
             if (token == igtToken) {
                 require(igtQuota[msg.sender] >= amount, "Insufficient IGT quota");
@@ -163,8 +172,7 @@ contract IGTExchangeManager {
                 revert("Unsupported token");
             }
         }
-
-        IERC20(token).transfer(msg.sender, amount);
+        require(IERC20(token).transfer(msg.sender, amount), "Token transfer failed"); // ✅加了 require 检查
         emit Claimed(msg.sender, token, amount);
     }
 
